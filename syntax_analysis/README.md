@@ -399,7 +399,7 @@ Also not supported, though they would be easy to add:
 
 Error recovery limitations:
 
-- Panic mode can skip valid code after an error. For example, after a missing `;` the next statement is usually skipped, and a broken `if (...)` header skips its whole block, so errors inside that block are only found in the next run.
+- Panic mode can skip valid code after an error. For example, after a missing `;` the next statement can be skipped: one that starts with a type name or a statement keyword (`int y = 10;`, `return x;`) is still parsed, but one that starts with an expression (`y = 10;`) is skipped up to its `;`. Likewise, a broken `if (...)` header skips its whole block, so errors inside that block are only found in the next run.
 - Errors inside a `for (...)` header may produce one extra follow-on error.
 
 ### 6.6 Future improvements
