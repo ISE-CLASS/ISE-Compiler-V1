@@ -188,3 +188,11 @@ cpp_tokenizer.py
 ├── 4. Graphviz export     export_automaton_graphviz()
 └── 5. Main                sample inputs, file mode, interactive mode
 ```
+
+## 10. Compiler UI
+
+The interactive React + TypeScript compiler workspace is in [`ui/`](./ui/).
+See [ui/README.md](./ui/README.md) for local setup, project persistence,
+GitHub workflow guidance and the HTTP integration contract for connecting
+the Python compiler phases. Workspace shortcuts are listed in
+[ui/SHORTCUTS.md](./ui/SHORTCUTS.md).
