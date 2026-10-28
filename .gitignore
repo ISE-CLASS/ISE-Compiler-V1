@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+PR_DESCRIPTION.md
+PRESENTATION_NOTES.md
+/UI INSPO
+concept.txt
+ui/node_modules/
+ui/dist/
+ui/*.tsbuildinfo
+PROJECT_CONCEPT.md
+PROJECT_PROGRESS.md
