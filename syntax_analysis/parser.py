@@ -21,8 +21,8 @@ from .tokens import (
     describe, is_identifier, is_keyword, is_symbol, lex,
 )
 
-ASSIGN_OPS = ("=", "+=", "-=", "*=", "/=", "%=")
-PREFIX_OPS = ("-", "+", "!", "++", "--")
+ASSIGN_OPS = ("=", "+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "|=", "^=")
+PREFIX_OPS = ("-", "+", "!", "~", "++", "--", "*", "&")
 POSTFIX_OPS = ("++", "--")
 
 LITERAL_KINDS = {
@@ -38,8 +38,8 @@ STATEMENT_KEYWORDS = {"if", "while", "do", "for", "return", "break", "continue"}
 # Real C++ keywords that are outside our subset, reported with a clear message.
 UNSUPPORTED_KEYWORDS = {
     "class", "struct", "union", "enum", "template", "typename", "namespace",
-    "switch", "case", "default", "goto", "try", "catch", "throw", "new",
-    "delete", "operator", "typedef", "auto", "const", "constexpr", "static",
+    "goto", "try", "catch", "throw", "new",
+    "delete", "operator", "typedef", "auto", "constexpr", "static",
     "extern", "long", "short", "signed", "unsigned", "nullptr", "this",
     "and", "or", "not", "sizeof", "virtual", "public", "private", "protected",
 }
@@ -202,8 +202,7 @@ class Parser:
     # ------------------------------------------------------------
     # Types
     # ------------------------------------------------------------
-    def at_type(self, offset=0):
-        """True if a type name starts at current + offset."""
+    def _is_base_type_token(self, offset=0):
         tok = self.peek(offset)
         if is_keyword(tok, *TYPE_KEYWORDS) or is_identifier(tok, STRING_TYPE):
             return True
@@ -211,16 +210,26 @@ class Parser:
                 and is_symbol(self.peek(offset + 1), "::")
                 and is_identifier(self.peek(offset + 2), STRING_TYPE))
 
+    def at_type(self, offset=0):
+        """True if a type name (optionally prefixed by const) starts at current + offset."""
+        if is_keyword(self.peek(offset), "const"):
+            return self._is_base_type_token(offset + 1)
+        return self._is_base_type_token(offset)
+
     def parse_type(self):
-        """type = "int" | "float" | "double" | "char" | "bool" | "void"
-                | "string" | "std" "::" "string" ;"""
-        if not self.at_type():
+        """Parse a base type name and return (type_name, is_const)."""
+        is_const = False
+        if is_keyword(self.current, "const"):
+            self.advance()
+            is_const = True
+        if not self._is_base_type_token():
             raise self.error_expected("a type name")
         tok = self.advance()
         if is_identifier(tok, "std"):
             self.advance()   # ::
             self.advance()   # string
-        return "string" if tok.kind == IDENTIFIER else tok.text
+        type_name = "string" if tok.kind == IDENTIFIER else tok.text
+        return type_name, is_const
 
     # ------------------------------------------------------------
     # Program and top-level declarations
@@ -249,13 +258,25 @@ class Parser:
         self.check_unsupported()
         if not self.at_type():
             raise self.error_expected("a declaration")
-        type_name = self.parse_type()
-        name = self.expect_identifier()
-        if is_symbol(self.current, "("):
-            return self.parse_function_rest(type_name, name, tok)
-        decl = ast.VarDecl(type_name, [], tok.line, tok.col)
-        decl.declarators.append(self.parse_declarator_tail(name))
-        self.parse_more_declarators(decl)
+        type_name, is_const = self.parse_type()
+        # Function declarator: [*...] name '(' ... ')'  vs var declarator
+        offset = 0
+        while is_symbol(self.peek(offset), "*"):
+            offset += 1
+        if self.peek(offset).kind == IDENTIFIER and is_symbol(self.peek(offset + 1), "("):
+            # Consume pointer stars (function pointers not modeled; keep simple)
+            while is_symbol(self.current, "*"):
+                self.advance()
+            name = self.expect_identifier()
+            if is_symbol(self.current, "("):
+                return self.parse_function_rest(type_name, is_const, name, tok)
+            decl = ast.VarDecl(type_name, [], is_const, tok.line, tok.col)
+            decl.declarators.append(self.parse_declarator_tail(name, is_const))
+            self.parse_more_declarators(decl, is_const)
+            return decl
+        decl = ast.VarDecl(type_name, [], is_const, tok.line, tok.col)
+        decl.declarators.append(self.parse_declarator(is_const))
+        self.parse_more_declarators(decl, is_const)
         return decl
 
     def parse_using(self):
@@ -268,9 +289,10 @@ class Parser:
         self.expect_symbol(";")
         return ast.UsingDirective("std", tok.line, tok.col)
 
-    def parse_function_rest(self, return_type, name, start):
+    def parse_function_rest(self, return_type, return_is_const, name, start):
         """func_rest = "(" [ params ] ")" ( block | ";" ) ;"""
-        func = ast.FunctionDecl(return_type, name.text, [], None, start.line, start.col)
+        func = ast.FunctionDecl(return_type, name.text, [], None, line=start.line, col=start.col)
+        # Return-type const is parsed/accepted but not modeled separately yet in FunctionDecl.
         self.expect_symbol("(")
         func.params = self.parse_params()
         self.expect_symbol(")")
@@ -296,12 +318,21 @@ class Parser:
         return params
 
     def parse_param(self):
-        """param = type [ IDENT ] [ "[" [ INTEGER_LITERAL ] "]" ] ;
+        """param = [ "const" ] type [ "*" ... ] [ "&" ] [ IDENT ] [ "[" [ INTEGER_LITERAL ] "]" ] ;
 
         The name is optional, as in C++ prototypes like "int f(int);".
         """
         tok = self.current
-        type_name = self.parse_type()
+        type_name, is_const = self.parse_type()
+        pointer_depth = 0
+        while is_symbol(self.current, "*"):
+            self.advance()
+            pointer_depth += 1
+            # Optional const after * not modeled yet.
+        is_reference = False
+        if is_symbol(self.current, "&"):
+            self.advance()
+            is_reference = True
         name = None
         if self.current.kind == IDENTIFIER:
             name = self.advance().text
@@ -312,28 +343,47 @@ class Parser:
                 self.advance()
             self.expect_symbol("]")
             is_array = True
-        return ast.Param(type_name, name, is_array, tok.line, tok.col)
+        return ast.Param(type_name, name, is_array, is_const, pointer_depth, is_reference, tok.line, tok.col)
 
     # ------------------------------------------------------------
     # Variable declarations
     # ------------------------------------------------------------
     def parse_var_decl(self):
-        """var_decl = type declarator { "," declarator } ";" ;"""
+        """var_decl = [ "const" ] type declarator { "," declarator } ";" ;"""
         tok = self.current
-        decl = ast.VarDecl(self.parse_type(), [], tok.line, tok.col)
-        decl.declarators.append(self.parse_declarator_tail(self.expect_identifier()))
-        self.parse_more_declarators(decl)
+        type_name, is_const = self.parse_type()
+        decl = ast.VarDecl(type_name, [], is_const, tok.line, tok.col)
+        decl.declarators.append(self.parse_declarator(is_const))
+        self.parse_more_declarators(decl, is_const)
         return decl
 
-    def parse_more_declarators(self, decl):
+    def parse_more_declarators(self, decl, is_const=False):
         while is_symbol(self.current, ","):
             self.advance()
-            decl.declarators.append(self.parse_declarator_tail(self.expect_identifier()))
+            decl.declarators.append(self.parse_declarator(is_const))
         self.expect_symbol(";")
 
-    def parse_declarator_tail(self, name):
-        """declarator = IDENT [ "[" [ expr ] "]" ] [ "=" initializer ] ;"""
-        d = ast.Declarator(name.text, False, None, None, name.line, name.col)
+    def parse_declarator(self, is_const=False):
+        pointer_depth = 0
+        while is_symbol(self.current, "*"):
+            self.advance()
+            pointer_depth += 1
+        name = self.expect_identifier()
+        d = ast.Declarator(name.text, False, None, None, is_const, pointer_depth, name.line, name.col)
+        if is_symbol(self.current, "["):
+            self.advance()
+            d.is_array = True
+            if not is_symbol(self.current, "]"):
+                d.array_size = self.parse_expression()
+            self.expect_symbol("]")
+        if is_symbol(self.current, "="):
+            self.advance()
+            d.init = self.parse_initializer()
+        return d
+
+    def parse_declarator_tail(self, name, is_const=False, pointer_depth=0):
+        """declarator tail after IDENT already consumed."""
+        d = ast.Declarator(name.text, False, None, None, is_const, pointer_depth, name.line, name.col)
         if is_symbol(self.current, "["):
             self.advance()
             d.is_array = True
@@ -404,6 +454,12 @@ class Parser:
             return self.parse_do_while()
         if is_keyword(tok, "for"):
             return self.parse_for()
+        if is_keyword(tok, "switch"):
+            return self.parse_switch()
+        if is_keyword(tok, "case"):
+            raise self.error_here("'case' outside of switch")
+        if is_keyword(tok, "default"):
+            raise self.error_here("'default' outside of switch")
         if is_keyword(tok, "return"):
             return self.parse_return()
         if is_keyword(tok, "break"):
@@ -481,6 +537,52 @@ class Parser:
         body = self.parse_statement()
         return ast.For(init, cond, update, body, tok.line, tok.col)
 
+    def parse_switch(self):
+        """switch_stmt = "switch" "(" expr ")" "{" { case_label | default_label | statement } "}" ;"""
+        tok = self.advance()  # switch
+        expr = self.parse_condition()
+        self.expect_symbol("{")
+        cases = []
+        current = None  # active Case/Default collecting statements
+        while not is_symbol(self.current, "}") and not self.at_eof():
+            if is_keyword(self.current, "case"):
+                ctok = self.advance()
+                value = self.parse_expression()
+                self.expect_symbol(":")
+                current = ast.Case(value, [], ctok.line, ctok.col)
+                cases.append(current)
+                continue
+            if is_keyword(self.current, "default"):
+                dtok = self.advance()
+                self.expect_symbol(":")
+                current = ast.Default([], dtok.line, dtok.col)
+                cases.append(current)
+                continue
+            # Statements before first label: parse but attach to a synthetic section-less
+            # container only if needed; simpler to require labels/allow by creating
+            # an implicit leading section is complex. For subset, collect into current
+            # if present; otherwise parse and discard? Better: if no current, create
+            # a dummy default-like behavior is wrong. We'll attach to a temporary
+            # prelude list stored on switch? Not in AST. Instead, if no current,
+            # start a synthetic Case-like container isn't typed. Practical: treat as
+            # statement in current if exists else raise.
+            if current is None:
+                raise self.error_here("statement before first 'case' or 'default' in switch")
+            start = self.pos
+            try:
+                current.body.append(self.parse_statement())
+            except ParseError as e:
+                self.report(e)
+                if self.pos == start:
+                    self.advance()
+                self.sync_statement()
+        if self.at_eof():
+            raise ParseError(
+                "expected '}' to close switch body but found end of file",
+                self.current.line, self.current.col)
+        self.advance()  # }
+        return ast.Switch(expr, cases, tok.line, tok.col)
+
     def parse_return(self):
         """"return" [ expr ] ";" """
         tok = self.advance()
@@ -498,17 +600,28 @@ class Parser:
         return self.parse_assignment()
 
     def parse_assignment(self):
-        """assignment = logical_or [ assign_op assignment ] ;   (right-associative)"""
-        left = self.parse_logical_or()
+        """assignment = ternary [ assign_op assignment ] ;   (right-associative)"""
+        left = self.parse_ternary()
         if is_symbol(self.current, *ASSIGN_OPS):
             op = self.advance()
-            if not isinstance(left, (ast.Identifier, ast.Index)):
+            if not isinstance(left, (ast.Identifier, ast.Index, ast.Deref)):
                 raise ParseError(
                     "left side of '{}' must be a variable or array element".format(op.text),
                     op.line, op.col)
             value = self.parse_assignment()
             return ast.Assign(op.text, left, value, op.line, op.col)
         return left
+
+    def parse_ternary(self):
+        """ternary = logical_or [ "?" expression ":" ternary ] ;   (right-associative)"""
+        cond = self.parse_logical_or()
+        if is_symbol(self.current, "?"):
+            q = self.advance()
+            when_true = self.parse_expression()
+            self.expect_symbol(":")
+            when_false = self.parse_ternary()
+            return ast.Ternary(cond, when_true, when_false, q.line, q.col)
+        return cond
 
     def parse_left_assoc(self, operand, ops):
         """operand { op operand }, building a left-leaning tree."""
@@ -524,8 +637,20 @@ class Parser:
         return self.parse_left_assoc(self.parse_logical_and, ("||",))
 
     def parse_logical_and(self):
-        """logical_and = equality { "&&" equality } ;"""
-        return self.parse_left_assoc(self.parse_equality, ("&&",))
+        """logical_and = bitwise_or { "&&" bitwise_or } ;"""
+        return self.parse_left_assoc(self.parse_bitwise_or, ("&&",))
+
+    def parse_bitwise_or(self):
+        """bitwise_or = bitwise_xor { "|" bitwise_xor } ;"""
+        return self.parse_left_assoc(self.parse_bitwise_xor, ("|",))
+
+    def parse_bitwise_xor(self):
+        """bitwise_xor = bitwise_and { "^" bitwise_and } ;"""
+        return self.parse_left_assoc(self.parse_bitwise_and, ("^",))
+
+    def parse_bitwise_and(self):
+        """bitwise_and = equality { "&" equality } ;"""
+        return self.parse_left_assoc(self.parse_equality, ("&",))
 
     def parse_equality(self):
         """equality = relational { ("==" | "!=") relational } ;"""
@@ -548,10 +673,15 @@ class Parser:
         return self.parse_left_assoc(self.parse_unary, ("*", "/", "%"))
 
     def parse_unary(self):
-        """unary = ("-" | "+" | "!" | "++" | "--") unary | postfix ;"""
+        """unary = ("-" | "+" | "!" | "~" | "++" | "--" | "*" | "&") unary | postfix ;"""
         if is_symbol(self.current, *PREFIX_OPS):
             op = self.advance()
-            return ast.Unary(op.text, self.parse_unary(), op.line, op.col)
+            operand = self.parse_unary()
+            if op.text == "&":
+                return ast.AddressOf(operand, op.line, op.col)
+            if op.text == "*":
+                return ast.Deref(operand, op.line, op.col)
+            return ast.Unary(op.text, operand, op.line, op.col)
         return self.parse_postfix()
 
     def parse_postfix(self):

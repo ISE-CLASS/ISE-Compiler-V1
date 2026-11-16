@@ -89,10 +89,19 @@ def compute(op, a, b):
             return None
         va, vb = int(va), int(vb)
         return ("int", va - vb * _trunc_div(va, vb))
-    if op in ("<<", ">>"):
-        if ka != "int" or kb != "int" or va < 0 or not (0 <= vb < 32):
+    if op in ("<<", ">>", "&", "|", "^"):
+        if ka != "int" or kb != "int":
             return None
-        r = (va << vb) if op == "<<" else (va >> vb)
+        if op in ("<<", ">>"):
+            if va < 0 or not (0 <= vb < 32):
+                return None
+            r = (va << vb) if op == "<<" else (va >> vb)
+        elif op == "&":
+            r = va & vb
+        elif op == "|":
+            r = va | vb
+        else:
+            r = va ^ vb
         return ("int", r) if INT_MIN <= r <= INT_MAX else None
     return None
 
@@ -185,6 +194,16 @@ class Simplifier:
                 s.update = self.expr(s.update, inner)
             if s.body is not None:
                 s.body = self.stmt(s.body, dict(inner))
+        elif isinstance(s, ast.Switch):
+            s.expr = self.expr(s.expr, env)
+            # Conservatively forget values assigned in any case/default body.
+            self._kill(env, assigned_vars(s))
+            for section in s.cases:
+                if isinstance(section, ast.Case):
+                    section.value = self.expr(section.value, dict(env))
+                if isinstance(section, (ast.Case, ast.Default)):
+                    inner = dict(env)
+                    section.body = [self.stmt(x, inner) for x in section.body]
         return s
 
     def var_decl(self, vd, env, track=True):
@@ -223,6 +242,18 @@ class Simplifier:
             if isinstance(e.callee, ast.Identifier):
                 return self.return_types.get(e.callee.name)
             return None
+        if isinstance(e, ast.Ternary):
+            t = self.type_of(e.when_true)
+            f = self.type_of(e.when_false)
+            if t is not None and f is not None and t == f:
+                return t
+            if t in NUMERIC and f in NUMERIC:
+                if "double" in (t, f):
+                    return "double"
+                if "float" in (t, f):
+                    return "float"
+                return "int"
+            return t or f
         if isinstance(e, ast.Assign):
             return self.type_of(e.target)
         if isinstance(e, (ast.Postfix,)) or (isinstance(e, ast.Unary) and e.op in ("++", "--")):
@@ -232,6 +263,14 @@ class Simplifier:
                 return "bool"
             t = self.type_of(e.operand)
             return "int" if t in ("bool", "char") else (t if t in NUMERIC else None)
+        if isinstance(e, ast.AddressOf):
+            t = self.type_of(e.operand)
+            return (t + "*") if t else None
+        if isinstance(e, ast.Deref):
+            t = self.type_of(e.operand)
+            if t and t.endswith("*"):
+                return t[:-1]
+            return None
         if isinstance(e, ast.Binary):
             if e.op in ("==", "!=", "<", ">", "<=", ">=", "&&", "||"):
                 return "bool"
@@ -256,7 +295,11 @@ class Simplifier:
     def lvalue(self, e, env):
         """Optimize inside an assignment target without replacing the variable."""
         if isinstance(e, ast.Index):
+            e.array = self.lvalue(e.array, env) if not isinstance(e.array, ast.Identifier) else e.array
             e.index = self.expr(e.index, env)
+            return e
+        if isinstance(e, ast.Deref):
+            e.operand = self.expr(e.operand, env)
             return e
         if isinstance(e, ast.Identifier):
             return e
@@ -286,7 +329,28 @@ class Simplifier:
             e.args = [self.expr(a, env) for a in e.args]
             return e
         if isinstance(e, ast.Index):
+            e.array = self.expr(e.array, env)
             e.index = self.expr(e.index, env)
+            return e
+        if isinstance(e, ast.AddressOf):
+            e.operand = self.lvalue(e.operand, env)
+            return e
+        if isinstance(e, ast.Deref):
+            e.operand = self.expr(e.operand, env)
+            return e
+        if isinstance(e, ast.Ternary):
+            e.condition = self.expr(e.condition, env)
+            true_env = dict(env)
+            false_env = dict(env)
+            e.when_true = self.expr(e.when_true, true_env)
+            e.when_false = self.expr(e.when_false, false_env)
+            self._kill(env, assigned_vars(e.when_true) | assigned_vars(e.when_false))
+            lv = literal_value(e.condition)
+            if lv is not None:
+                chosen = e.when_true if lv[1] else e.when_false
+                self.stats.record("constant_folding", e.line,
+                                  "{} -> ternary branch".format("?:"))
+                return chosen
             return e
         return e
 
@@ -335,6 +399,11 @@ class Simplifier:
                 result = ("float", v) if kind == "float" else ("int", int(v))
             elif e.op == "!":
                 result = ("bool", not v)
+            elif e.op == "~":
+                if kind == "int":
+                    r = ~int(v)
+                    if INT_MIN <= r <= INT_MAX:
+                        result = ("int", r)
             if result is not None:
                 before = unparse(e)
                 node = make_literal(result[0], result[1], e)

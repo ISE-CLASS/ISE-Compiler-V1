@@ -307,8 +307,8 @@ class TestSyntaxErrors(ParserTestCase):
             "but found end of file at line 3, column 1"])
 
     def test_missing_operand(self):
-        self.assertEqual(self.errors("int x = * 3;"),
-                         ["Syntax error: expected an expression but found '*' at line 1, column 9"])
+        self.assertEqual(self.errors("int x = * ;"),
+                         ["Syntax error: expected an expression but found ';' at line 1, column 11"])
 
     def test_invalid_assignment_target(self):
         self.assertEqual(self.errors("int main() { 5 = x; }"), [

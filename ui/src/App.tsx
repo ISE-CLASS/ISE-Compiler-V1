@@ -5,16 +5,20 @@ import {
   Check,
   CircleAlert,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   CircleHelp,
   Code2,
   Command,
+  Cpu,
   Copy,
+  Database,
   Download,
   FileCode2,
   FilePlus2,
   Folder,
   FolderPlus,
+  GripVertical,
   Moon,
   Pencil,
   Play,
@@ -26,21 +30,77 @@ import {
   Sun,
   Terminal,
   Trash2,
+  Workflow,
   X,
   Zap,
 } from "lucide-react";
-import { type FormEvent, useEffect, useMemo, useState } from "react";
+import { type FormEvent, type MouseEvent as ReactMouseEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type SourceFile = { name: string; value: string };
 type Project = { id: string; name: string; files: SourceFile[]; folders: string[] };
 type EntryDialog = { kind: "file" | "folder" | "project" | "rename"; value: string; source?: string };
+type CompilerStage = "run" | "compile" | "tokenize" | "parse" | "optimize" | "semantic" | "ir" | "assembly";
+type DiagnosticDetail = {
+  stage: string;
+  severity: string;
+  message: string;
+  line: number;
+  col: number;
+};
+type SymbolInfo = {
+  name: string;
+  kind?: string;
+  type?: string;
+  return_type?: string;
+  params?: { name: string | null; type: string }[];
+  defined?: boolean;
+  line?: number;
+  col?: number;
+};
 type CompilerResult = {
+  ok?: boolean;
+  stage?: string;
+  failed_stage?: string | null;
   output?: string;
   diagnostics?: string[];
+  diagnostic_details?: DiagnosticDetail[];
   tokens?: { kind: string; text: string; line: number; col: number }[];
   ast?: string;
+  semantic?: {
+    ok?: boolean;
+    symbols?: SymbolTable;
+    functions?: SymbolInfo[];
+    globals?: SymbolInfo[];
+    errors?: DiagnosticDetail[];
+    warnings?: DiagnosticDetail[];
+  };
+  symbols?: SymbolTable;
+  optimization?: { total?: number; rounds?: number; summary?: string[] };
+  optimized_source?: string;
+  ir?: string;
+  assembly?: string;
+  execution?: { ok?: boolean; stdout?: string; stderr?: string; returncode?: number | null; log?: string };
+  toolchain?: { name?: string | null; version?: string; target?: string; supports_assembly?: boolean };
+  stages?: { name: string; ok: boolean; detail?: string; duration_ms?: number }[];
 };
-type Panel = "output" | "problems" | "tokens" | "ast";
+type SymbolTable = {
+  functions?: SymbolInfo[];
+  globals?: SymbolInfo[];
+  scopes?: { id: number; kind: string; name: string; symbols: SymbolInfo[] }[];
+};
+type Panel = "output" | "problems" | "tokens" | "ast" | "symbols" | "ir" | "assembly";
+type Connection = "checking" | "connected" | "offline";
+
+const stagePanels: Record<CompilerStage, Panel> = {
+  run: "output",
+  compile: "output",
+  tokenize: "tokens",
+  parse: "ast",
+  optimize: "output",
+  semantic: "symbols",
+  ir: "ir",
+  assembly: "assembly",
+};
 
 const starterCode = `#include <iostream>
 using namespace std;
@@ -72,6 +132,9 @@ const panels: { id: Panel; label: string; icon: typeof Terminal }[] = [
   { id: "problems", label: "Problems", icon: CircleAlert },
   { id: "tokens", label: "Tokens", icon: Braces },
   { id: "ast", label: "Syntax tree", icon: Activity },
+  { id: "symbols", label: "Semantics", icon: Database },
+  { id: "ir", label: "IR", icon: Workflow },
+  { id: "assembly", label: "Assembly", icon: Cpu },
 ];
 
 function loadProjects(): Project[] {
@@ -120,18 +183,63 @@ function App() {
   );
   const [panel, setPanel] = useState<Panel>("output");
   const [codePanelOpen, setCodePanelOpen] = useState(true);
-  const [stage, setStage] = useState<"compile" | "tokenize" | "parse">("compile");
+  const [stage, setStage] = useState<CompilerStage>("run");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<CompilerResult | null>(null);
   const [runError, setRunError] = useState("");
+  const [connection, setConnection] = useState<Connection>("checking");
   const [toast, setToast] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [entryDialog, setEntryDialog] = useState<EntryDialog | null>(null);
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem("compiled-layout") ?? "{}");
+      return typeof saved.sidebarWidth === "number" ? Math.min(420, Math.max(160, saved.sidebarWidth)) : 218;
+    } catch { return 218; }
+  });
+  const [rightWidth, setRightWidth] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem("compiled-layout") ?? "{}");
+      return typeof saved.rightWidth === "number" ? Math.min(700, Math.max(280, saved.rightWidth)) : 390;
+    } catch { return 390; }
+  });
+  const resizeRef = useRef<{ kind: "sidebar" | "right"; startX: number; startSidebar: number; startRight: number } | null>(null);
 
   const currentFile = files.find((file) => file.name === activeFile) ?? files[0];
-  const apiUrl = import.meta.env.VITE_COMPILER_API_URL?.replace(/\/$/, "");
   const isCpp = currentFile?.name.endsWith(".cpp") ?? true;
+
+  const apiUrl = useMemo(() => {
+    const configured = import.meta.env.VITE_COMPILER_API_URL?.replace(/\/$/, "");
+    if (configured) return configured;
+    if (typeof window === "undefined") return "http://localhost:8000";
+    if (window.location.port === "8000") return window.location.origin;
+    const host = window.location.hostname || "localhost";
+    return `http://${host}:8000`;
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 2500);
+    fetch(`${apiUrl}/api/health`, { signal: controller.signal })
+      .then((response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json();
+      })
+      .then(() => {
+        if (!cancelled) setConnection("connected");
+      })
+      .catch(() => {
+        if (!cancelled) setConnection("offline");
+      })
+      .finally(() => window.clearTimeout(timer));
+    return () => {
+      cancelled = true;
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [apiUrl]);
 
   useEffect(() => {
     localStorage.setItem("compiled-projects", JSON.stringify(projects));
@@ -156,6 +264,43 @@ function App() {
     const timer = window.setTimeout(() => setToast(""), 2400);
     return () => window.clearTimeout(timer);
   }, [toast]);
+
+  useEffect(() => {
+    localStorage.setItem("compiled-layout", JSON.stringify({ sidebarWidth, rightWidth }));
+  }, [sidebarWidth, rightWidth]);
+
+  useEffect(() => {
+    const onMove = (event: MouseEvent) => {
+      const drag = resizeRef.current;
+      if (!drag) return;
+      const delta = event.clientX - drag.startX;
+      if (drag.kind === "sidebar") {
+        setSidebarWidth(Math.min(420, Math.max(160, drag.startSidebar + delta)));
+      } else {
+        setRightWidth(Math.min(700, Math.max(280, drag.startRight - delta)));
+      }
+    };
+    const onUp = () => {
+      if (resizeRef.current) {
+        resizeRef.current = null;
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+      }
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, []);
+
+  const startResize = (kind: "sidebar" | "right") => (event: ReactMouseEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    resizeRef.current = { kind, startX: event.clientX, startSidebar: sidebarWidth, startRight: rightWidth };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  };
 
   useEffect(() => {
     const handleShortcuts = (event: KeyboardEvent) => {
@@ -189,26 +334,39 @@ function App() {
       : project));
   };
 
-  const runCompiler = async () => {
+  const runCompiler = async (selectedStage: CompilerStage = stage) => {
     if (!currentFile) return;
     setBusy(true);
     setRunError("");
     setResult(null);
     setPanel("output");
-    if (!apiUrl) {
-      await new Promise((resolve) => window.setTimeout(resolve, 650));
-      setResult({
-        output: "The Python compiler backend is not connected yet.\n\nYour source is saved in this browser. Set VITE_COMPILER_API_URL to connect the compiler service.",
-      });
-      setBusy(false);
-      return;
+    if (connection === "offline") {
+      try {
+        const probe = await fetch(`${apiUrl}/api/health`);
+        if (!probe.ok) throw new Error(`HTTP ${probe.status}`);
+        setConnection("connected");
+      } catch {
+        await new Promise((resolve) => window.setTimeout(resolve, 350));
+        setResult({
+          output: "The Python compiler backend is not connected.\n\nStart it with:\n\n  python -m compiler.server --open\n\n(or set VITE_COMPILER_API_URL). Your source is saved in this browser.",
+        });
+        setRunError(`Cannot reach the compiler service at ${apiUrl}`);
+        setConnection("offline");
+        setBusy(false);
+        return;
+      }
     }
 
     try {
-      const response = await fetch(`${apiUrl}/api/${stage}`, {
+      const response = await fetch(`${apiUrl}/api/${selectedStage}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filename: currentFile.name.split("/").pop(), source: currentFile.value, stdin: "" }),
+        body: JSON.stringify({
+          filename: currentFile.name.split("/").pop(),
+          source: currentFile.value,
+          stdin: "",
+          optimize: true,
+        }),
       });
       if (!response.ok) {
         throw new Error(`Compiler service returned ${response.status} ${response.statusText}`.trim());
@@ -217,12 +375,22 @@ function App() {
       if (!payload || typeof payload !== "object") {
         throw new Error("Compiler service returned an invalid response.");
       }
-      setResult(payload as CompilerResult);
+      const compilerResult = payload as CompilerResult;
+      setResult(compilerResult);
+      setConnection("connected");
+      setPanel(compilerResult.ok === false ? "problems" : stagePanels[selectedStage]);
     } catch (error) {
       setRunError(error instanceof Error ? error.message : "Could not connect to the compiler service.");
+      setConnection("offline");
+      setPanel("problems");
     } finally {
       setBusy(false);
     }
+  };
+
+  const runStage = (next: CompilerStage) => {
+    setStage(next);
+    void runCompiler(next);
   };
 
   const addFile = () => {
@@ -396,8 +564,8 @@ function App() {
         <button className="top-action hide-small" onClick={() => setSearchOpen((open) => !open)}>
           <Search size={15} /><span>Find</span><kbd><Command size={10} /> K</kbd>
         </button>
-        <span className={`connection ${apiUrl ? "connected" : ""}`}>
-          <span className="connection-dot" />{apiUrl ? "Backend connected" : "Saved in browser"}
+        <span className={`connection ${connection === "connected" ? "connected" : ""}`}>
+          <span className="connection-dot" />{connection === "connected" ? "Backend connected" : connection === "checking" ? "Connecting…" : "Backend offline"}
         </span>
         <button className="icon-button theme-toggle" title={`Switch to ${theme === "dark" ? "light" : "dark"} theme`} onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
           {theme === "dark" ? <Sun size={17} /> : <Moon size={17} />}
@@ -418,7 +586,14 @@ function App() {
         </div>
       )}
 
-      <div className="workspace">
+      <div
+        className="workspace"
+        style={{
+          gridTemplateColumns: codePanelOpen
+            ? `48px ${sidebarWidth}px 10px minmax(320px, 1fr) 10px ${rightWidth}px`
+            : `48px 52px minmax(320px, 1fr) 10px ${rightWidth}px`,
+        }}
+      >
         <aside className="activity-rail" aria-label="Workspace tools">
           <button className="rail-button selected" title="Explorer"><Folder size={18} /></button>
           <button className="rail-button" title="Search files" onClick={() => setSearchOpen((open) => !open)}><Search size={18} /></button>
@@ -432,14 +607,14 @@ function App() {
 
         <aside className={`file-sidebar ${codePanelOpen ? "" : "sidebar-collapsed"}`}>
           <div className="sidebar-heading">
-            <span>Explorer</span>
+            <span>{codePanelOpen ? "Explorer" : ""}</span>
             <div className="sidebar-tools">
               <button className="icon-button tiny" title="New folder" onClick={addFolder}><FolderPlus size={15} /></button>
               <button className="icon-button tiny" title="New file" onClick={addFile}><FilePlus2 size={15} /></button>
             </div>
           </div>
           <button className="project-tree" onClick={() => { setCodePanelOpen((open) => !open); setActiveFolder(""); }}>
-            {codePanelOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}<Folder size={15} className="folder-icon" /><span>{activeProject?.name.toUpperCase()}</span>
+            {codePanelOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}<Folder size={15} className="folder-icon" />{codePanelOpen && <span>{activeProject?.name.toUpperCase()}</span>}
           </button>
           {codePanelOpen && (
             <div className="file-list">
@@ -468,12 +643,22 @@ function App() {
             </div>
           )}
           <div className="sidebar-footer">
-            <div className="project-card">
-              <div className="project-card-icon"><Sparkles size={16} /></div>
-              <div><strong>Local project</strong><span>Saved in this browser.</span></div>
-            </div>
+            {codePanelOpen ? (
+              <div className="project-card">
+                <div className="project-card-icon"><Folder size={16} /></div>
+                <div><strong>Local project</strong><span>Saved in this browser.</span></div>
+              </div>
+            ) : (
+              <button className="icon-button tiny" title="Expand explorer" onClick={() => setCodePanelOpen(true)}><ChevronRight size={15} /></button>
+            )}
           </div>
         </aside>
+
+        {codePanelOpen ? (
+          <div className="resize-handle" role="separator" aria-label="Resize explorer" title="Drag to resize" onMouseDown={startResize("sidebar")}>
+            <ChevronLeft size={10} /><GripVertical size={12} /><ChevronRight size={10} />
+          </div>
+        ) : <div className="resize-handle disabled" aria-hidden="true" />}
 
         <section className="editor-column">
           <div className="editor-toolbar">
@@ -529,19 +714,28 @@ function App() {
           </div>
         </section>
 
+        <div className="resize-handle" role="separator" aria-label="Resize panels" title="Drag to resize" onMouseDown={startResize("right")}>
+          <ChevronLeft size={10} /><GripVertical size={12} /><ChevronRight size={10} />
+        </div>
+
         <section className="right-column">
           <div className="runbar">
             <div className="runbar-label"><Zap size={15} /><span>Run configuration</span></div>
             <div className="run-controls">
               <label className="stage-select">
-                <select value={stage} onChange={(event) => setStage(event.target.value as typeof stage)} aria-label="Compiler stage">
-                  <option value="compile">Compile</option>
+                <select value={stage} onChange={(event) => setStage(event.target.value as CompilerStage)} aria-label="Compiler stage">
+                  <option value="run">Compile &amp; run</option>
+                  <option value="compile">Compile (all stages)</option>
                   <option value="tokenize">Tokenize</option>
                   <option value="parse">Parse</option>
+                  <option value="optimize">Optimize</option>
+                  <option value="semantic">Semantic analysis</option>
+                  <option value="ir">Intermediate code</option>
+                  <option value="assembly">Assembly</option>
                 </select>
                 <ChevronDown size={13} />
               </label>
-              <button className="run-button" onClick={runCompiler} disabled={busy || !isCpp}>
+              <button className="run-button" onClick={() => void runCompiler()} disabled={busy || !isCpp}>
                 {busy ? <RotateCcw className="spin" size={15} /> : <Play size={14} fill="currentColor" />}
                 {busy ? "Running" : "Run"}
               </button>
@@ -562,22 +756,31 @@ function App() {
               {panel === "output" && (
                 <div className="output-view">
                   {busy ? (
-                    <div className="empty-state"><div className="loader-ring" /><strong>{apiUrl ? "Running your program" : "Checking workspace"}</strong><span>{apiUrl ? "Waiting for compiler results…" : "Checking compiler connection…"}</span></div>
+                    <div className="empty-state"><div className="loader-ring" /><strong>Running {stage === "run" ? "your program" : `the ${stage} stage`}</strong><span>Waiting for compiler results…</span></div>
                   ) : runError ? (
-                    <div className="error-card"><div className="error-title"><X size={15} />Could not run compiler</div><p>{runError}</p><span>Check the API URL and make sure the Python service is running.</span></div>
+                    <div className="error-card"><div className="error-title"><X size={15} />Could not reach the compiler service</div><p>{runError}</p><span>Start it with <code>python -m compiler.server --open</code>, then run again.</span></div>
                   ) : result ? (
                     <>
                       {result.diagnostics?.map((diagnostic, index) => <div className="diagnostic" key={index}><Activity size={14} /><span>{diagnostic}</span></div>)}
                       <pre className="console-output">{result.output || "No output."}</pre>
-                      {apiUrl && <div className="run-complete"><Check size={13} />Run complete <span>·</span>{stats.lines} lines</div>}
-                      {!apiUrl && <div className="run-notice">Compiler not connected. Source was not compiled.</div>}
+                      {result.stages?.length ? (
+                        <div className="pipeline-stages">
+                          {result.stages.map((item) => (
+                            <span key={item.name} className={`pipeline-stage ${item.ok ? "pipeline-stage-ok" : "pipeline-stage-failed"}`} title={item.detail || ""}>
+                              {item.ok ? <Check size={11} /> : <X size={11} />}{item.name}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
+                      {result.execution?.ok && <div className="run-complete"><Check size={13} />Run complete <span>·</span>{stats.lines} lines</div>}
+                      {connection === "offline" && <div className="run-notice">Compiler not connected. Source was not compiled.</div>}
                     </>
                   ) : (
                     <div className="empty-state">
                       <div className="empty-icon"><Terminal size={20} /></div>
                       <strong>Ready when you are</strong>
                       <span>Run your program to see output here.</span>
-                      <button className="empty-run" onClick={runCompiler}><Play size={13} fill="currentColor" />Run program</button>
+                      <button className="empty-run" onClick={() => void runCompiler()}><Play size={13} fill="currentColor" />Run program</button>
                     </div>
                   )}
                 </div>
@@ -585,9 +788,19 @@ function App() {
               {panel === "problems" && (
                 <div className="data-view problems-view">
                   {runError && <div className="problem-row"><X size={15} /><div><strong>Compiler connection error</strong><span>{runError}</span></div></div>}
-                  {result?.diagnostics?.map((diagnostic, index) => <div className="problem-row" key={index}><Activity size={15} /><div><strong>Compiler diagnostic</strong><span>{diagnostic}</span></div></div>)}
-                  {!runError && !result?.diagnostics?.length && (!apiUrl
-                    ? <div className="connection-notice"><CircleHelp size={15} /><div><strong>Compiler not connected</strong><span>Connect the Python service to report compiler errors and warnings here.</span></div></div>
+                  {result?.diagnostic_details?.length
+                    ? result.diagnostic_details.map((diagnostic, index) => (
+                      <div className={`problem-row problem-${diagnostic.severity}`} key={`${diagnostic.stage}-${diagnostic.line}-${index}`}>
+                        <Activity size={15} />
+                        <div>
+                          <strong><span className="problem-stage">{diagnostic.stage}</span>{diagnostic.severity === "warning" ? "Warning" : diagnostic.severity === "info" ? "Info" : "Error"}{diagnostic.line ? ` at line ${diagnostic.line}${diagnostic.col ? `, column ${diagnostic.col}` : ""}` : ""}</strong>
+                          <span>{diagnostic.message}</span>
+                        </div>
+                      </div>
+                    ))
+                    : result?.diagnostics?.map((diagnostic, index) => <div className="problem-row" key={index}><Activity size={15} /><div><strong>Compiler diagnostic</strong><span>{diagnostic}</span></div></div>)}
+                  {!runError && !result?.diagnostics?.length && (connection === "offline"
+                    ? <div className="connection-notice"><CircleHelp size={15} /><div><strong>Compiler not connected</strong><span>Start <code>python -m compiler.server --open</code> to report compiler errors and warnings here.</span></div></div>
                     : <div className="empty-state compact"><div className="empty-icon"><Check size={19} /></div><strong>{result ? "No problems reported" : "No problems yet"}</strong><span>Run a compiler stage to inspect diagnostics.</span></div>)}
                 </div>
               )}
@@ -597,26 +810,72 @@ function App() {
                     <table className="token-table"><thead><tr><th>Kind</th><th>Lexeme</th><th>Position</th></tr></thead><tbody>
                       {result.tokens.map((token, index) => <tr key={`${token.line}-${token.col}-${index}`}><td><span className={`token-kind token-${token.kind.toLowerCase()}`}>{token.kind}</span></td><td className="token-lexeme">{token.text}</td><td className="token-position">{token.line}:{token.col}</td></tr>)}
                     </tbody></table>
-                  ) : <div className="empty-state compact"><div className="empty-icon"><Braces size={19} /></div><strong>No tokens yet</strong><span>Run the tokenizer stage to inspect lexemes.</span></div>}
+                  ) : <div className="empty-state compact"><div className="empty-icon"><Braces size={19} /></div><strong>No tokens yet</strong><span>Run the tokenizer stage to inspect lexemes.</span><button className="empty-run" onClick={() => runStage("tokenize")}><Play size={13} fill="currentColor" />Run tokenizer</button></div>}
                 </div>
               )}
               {panel === "ast" && (
                 <div className="data-view ast-view">
-                  {result?.ast ? <pre className="console-output">{result.ast}</pre> : <div className="empty-state compact"><div className="empty-icon"><Activity size={19} /></div><strong>No syntax tree yet</strong><span>Run the parser stage to see the AST.</span></div>}
+                  {result?.ast ? <pre className="console-output">{result.ast}</pre> : <div className="empty-state compact"><div className="empty-icon"><Activity size={19} /></div><strong>No syntax tree yet</strong><span>Run the parser stage to see the AST.</span><button className="empty-run" onClick={() => runStage("parse")}><Play size={13} fill="currentColor" />Run parser</button></div>}
+                </div>
+              )}
+              {panel === "symbols" && (
+                <div className="data-view symbols-view">
+                  {result?.semantic?.ok || result?.symbols ? (
+                    <div className="symbol-sections">
+                      <section>
+                        <h4>Symbol table</h4>
+                        <table className="symbol-table"><thead><tr><th>Name</th><th>Kind</th><th>Type</th><th>Position</th></tr></thead><tbody>
+                          {(result.symbols?.globals ?? result.semantic?.globals ?? []).map((symbol) => (
+                            <tr key={`global-${symbol.name}-${symbol.line}`}><td>{symbol.name}</td><td>global</td><td className="token-lexeme">{symbol.type}</td><td className="token-position">{symbol.line}:{symbol.col}</td></tr>
+                          ))}
+                          {(result.symbols?.functions ?? result.semantic?.functions ?? []).map((fn) => (
+                            <tr key={`fn-${fn.name}`}><td>{fn.name}</td><td>function{fn.defined === false ? " (declaration)" : ""}</td><td className="token-lexeme">{(fn.return_type ?? "?")}({(fn.params ?? []).map((param) => `${param.type}${param.name ? ` ${param.name}` : ""}`).join(", ")})</td><td className="token-position">{fn.line}:{fn.col}</td></tr>
+                          ))}
+                        </tbody></table>
+                      </section>
+                      <section>
+                        <h4>Scopes <span className="muted">({(result.symbols?.scopes ?? []).length})</span></h4>
+                        <div className="scope-list">
+                          {(result.symbols?.scopes ?? []).map((scope) => (
+                            <div className="scope-row" key={scope.id}>
+                              <strong>{scope.kind}</strong><span>{scope.name}</span>
+                              <em>{scope.symbols.length} symbol(s)</em>
+                            </div>
+                          ))}
+                        </div>
+                      </section>
+                      {result.semantic?.warnings?.length ? <section><h4>Warnings</h4>{result.semantic.warnings.map((item, index) => <div className="diagnostic" key={index}><Activity size={13} /><span>{item.message}</span></div>)}</section> : null}
+                    </div>
+                  ) : <div className="empty-state compact"><div className="empty-icon"><Database size={19} /></div><strong>No semantic results yet</strong><span>Run semantic analysis to inspect symbols, functions and scopes.</span><button className="empty-run" onClick={() => runStage("semantic")}><Play size={13} fill="currentColor" />Run semantic analysis</button></div>}
+                </div>
+              )}
+              {panel === "ir" && (
+                <div className="data-view ir-view">
+                  {result?.ir ? (
+                    <>
+                      <pre className="console-output">{result.ir}</pre>
+                      {result.optimized_source ? <details className="optimized-source"><summary>Optimized C++ source</summary><pre className="console-output">{result.optimized_source}</pre></details> : null}
+                    </>
+                  ) : <div className="empty-state compact"><div className="empty-icon"><Workflow size={19} /></div><strong>No intermediate code yet</strong><span>Run the IR stage to inspect three-address code.</span><button className="empty-run" onClick={() => runStage("ir")}><Play size={13} fill="currentColor" />Generate IR</button></div>}
+                </div>
+              )}
+              {panel === "assembly" && (
+                <div className="data-view assembly-view">
+                  {result?.assembly ? <pre className="console-output">{result.assembly}</pre> : <div className="empty-state compact"><div className="empty-icon"><Cpu size={19} /></div><strong>No assembly code yet</strong><span>Generated x86-64 assembly will appear here.</span><button className="empty-run" onClick={() => runStage("assembly")}><Play size={13} fill="currentColor" />Generate assembly</button></div>}
                 </div>
               )}
             </div>
           </div>
 
           <div className="backend-card">
-            <div className="backend-icon">{apiUrl ? <Check size={16} /> : <Sparkles size={16} />}</div>
+            <div className="backend-icon">{connection === "connected" ? <Check size={16} /> : <Sparkles size={16} />}</div>
             <div className="backend-copy">
-              <strong>{apiUrl ? "Compiler service connected" : "Compiler service not connected"}</strong>
-              <span>{apiUrl ? apiUrl : "Source is not compiled until the Python service is connected."}</span>
+              <strong>{connection === "connected" ? "Compiler service connected" : connection === "checking" ? "Looking for compiler service…" : "Compiler service offline"}</strong>
+              <span>{connection === "connected" ? `${apiUrl} · ${result?.toolchain?.version ?? "x86-64"}` : `Start python -m compiler.server --open (expected at ${apiUrl}).`}</span>
             </div>
           </div>
           <footer className="panel-footer">
-            <span><span className="footer-dot" />{apiUrl ? "Connected" : "Saved locally"}</span>
+            <span><span className="footer-dot" />{connection === "connected" ? "Connected" : "Saved locally"}</span>
             <span>{stats.chars.toLocaleString()} characters</span>
           </footer>
         </section>

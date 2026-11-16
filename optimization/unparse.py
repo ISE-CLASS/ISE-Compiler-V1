@@ -11,17 +11,22 @@ INDENT = "    "
 
 # Higher number = binds tighter.
 BINARY_PREC = {
-    "||": 1, "&&": 2,
-    "==": 3, "!=": 3,
-    "<": 4, ">": 4, "<=": 4, ">=": 4,
-    "<<": 5, ">>": 5,
-    "+": 6, "-": 6,
-    "*": 7, "/": 7, "%": 7,
+    "||": 1,
+    "&&": 2,
+    "|": 3,
+    "^": 4,
+    "&": 5,
+    "==": 6, "!=": 6,
+    "<": 7, ">": 7, "<=": 7, ">=": 7,
+    "<<": 8, ">>": 8,
+    "+": 9, "-": 9,
+    "*": 10, "/": 10, "%": 10,
 }
-PREC_ASSIGN = 0
-PREC_UNARY = 8
-PREC_POSTFIX = 9
-PREC_PRIMARY = 10
+PREC_TERNARY = 0
+PREC_ASSIGN = -1
+PREC_UNARY = 11
+PREC_POSTFIX = 12
+PREC_PRIMARY = 13
 
 
 class Unparser:
@@ -66,9 +71,16 @@ class Unparser:
         return name
 
     def param(self, p):
-        text = self.type_text(p.type_name)
+        text = ("const " if getattr(p, "is_const", False) else "") + self.type_text(p.type_name)
+        stars = "*" * getattr(p, "pointer_depth", 0)
+        if stars:
+            text += stars
+        if getattr(p, "is_reference", False):
+            text += "&"
         if p.name:
             text += " " + p.name
+        elif stars or getattr(p, "is_reference", False):
+            pass
         if p.is_array:
             text += "[]"
         return text
@@ -81,7 +93,7 @@ class Unparser:
         return self.block_lines(fn.body, 0, head + " ")
 
     def declarator(self, d):
-        text = d.name
+        text = ("*" * getattr(d, "pointer_depth", 0)) + d.name
         if d.is_array:
             text += "[{}]".format(self.expr(d.array_size) if d.array_size is not None else "")
         if d.init is not None:
@@ -94,8 +106,9 @@ class Unparser:
         return self.expr(node)
 
     def vardecl_text(self, vd):
-        return "{} {}".format(self.type_text(vd.type_name),
-                              ", ".join(self.declarator(d) for d in vd.declarators))
+        prefix = "const " if getattr(vd, "is_const", False) else ""
+        return "{}{} {}".format(prefix, self.type_text(vd.type_name),
+                                ", ".join(self.declarator(d) for d in vd.declarators))
 
     # ----- statements -----
     def block_lines(self, block, level, prefix=""):
@@ -143,6 +156,19 @@ class Unparser:
         if isinstance(s, ast.For):
             return self.body(s.body if s.body is not None else ast.EmptyStmt(),
                              level, "for ({}) ".format(self.for_header(s)))
+        if isinstance(s, ast.Switch):
+            lines = [pad + "switch (" + self.expr(s.expr) + ") {"]
+            for section in s.cases:
+                if isinstance(section, ast.Case):
+                    lines.append(INDENT * (level + 1) + "case " + self.expr(section.value) + ":")
+                elif isinstance(section, ast.Default):
+                    lines.append(INDENT * (level + 1) + "default:")
+                else:
+                    continue
+                for stmt in section.body:
+                    lines.extend(self.stmt(stmt, level + 2))
+            lines.append(pad + "}")
+            return lines
         if isinstance(s, (ast.Preprocessor, ast.UsingDirective, ast.FunctionDecl)):
             return ["{}{}".format(pad, line) for line in self.top_level(s)]
         raise TypeError("cannot print statement " + type(s).__name__)
@@ -196,14 +222,25 @@ class Unparser:
         if isinstance(e, ast.Binary):
             p = BINARY_PREC[e.op]
             return "{} {} {}".format(self.expr(e.left, p), e.op, self.expr(e.right, p, "right")), p
+        if isinstance(e, ast.Ternary):
+            return "{} ? {} : {}".format(
+                self.expr(e.condition, 1),
+                self.expr(e.when_true, 1),
+                self.expr(e.when_false, PREC_TERNARY)), PREC_TERNARY
         if isinstance(e, ast.Assign):
             return "{} {} {}".format(self.expr(e.target, PREC_UNARY),
-                                     e.op, self.expr(e.value, PREC_ASSIGN)), PREC_ASSIGN
+                                     e.op, self.expr(e.value, PREC_TERNARY)), PREC_ASSIGN
         if isinstance(e, ast.Unary):
             inner = self.expr(e.operand, PREC_UNARY)
             if inner.startswith(e.op[0]):
-                inner = " " + inner          # avoid "--x" meaning something else
+                inner = " " + inner
             return e.op + inner, PREC_UNARY
+        if isinstance(e, ast.AddressOf):
+            inner = self.expr(e.operand, PREC_UNARY)
+            return "&" + inner, PREC_UNARY
+        if isinstance(e, ast.Deref):
+            inner = self.expr(e.operand, PREC_UNARY)
+            return "*" + inner, PREC_UNARY
         if isinstance(e, ast.Postfix):
             return self.expr(e.operand, PREC_POSTFIX) + e.op, PREC_POSTFIX
         if isinstance(e, ast.Call):
