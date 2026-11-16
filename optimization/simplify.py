@@ -128,13 +128,28 @@ class Simplifier:
 
     def function(self, fn):
         self.types = dict(self.global_types)
+        self.unsafe = set()
         for p in fn.params:
             if p.name:
                 self._declare_type(p.name, p.type_name)
+                if getattr(p, "is_reference", False) or getattr(p, "pointer_depth", 0) > 0 or p.is_array:
+                    # reference/decayed params may alias; be conservative
+                    self.unsafe.add(p.name)
         self._collect_local_types(fn.body)
+        # mark address-taken locals/params as unsafe for propagation
+        for n in walk(fn.body):
+            if isinstance(n, ast.AddressOf):
+                b = base_name(n.operand)
+                if b:
+                    self.unsafe.add(b)
+            elif isinstance(n, ast.Assign) and isinstance(n.target, ast.Deref):
+                b = base_name(n.target.operand)
+                if b:
+                    # pointer value itself not written, but pointed-to memory may alias; keep conservative
+                    pass
         env = {}
         for p in fn.params:
-            if p.name:
+            if p.name and p.name not in self.unsafe:
                 env[p.name] = Entry(p.type_name, None)
         self.stmt(fn.body, env)
 
@@ -214,9 +229,9 @@ class Simplifier:
                 d.init.elements = [self.expr(e, env) for e in d.init.elements]
             elif d.init is not None:
                 d.init = self.expr(d.init, env)
-            if track:
+            if track and d.name not in getattr(self, "unsafe", set()):
                 value = None
-                if not d.is_array and isinstance(d.init, ast.Literal):
+                if not d.is_array and getattr(d, "pointer_depth", 0) == 0 and isinstance(d.init, ast.Literal):
                     value = convert(d.init, vd.type_name)
                 env[d.name] = Entry(vd.type_name, value)
 
@@ -313,20 +328,52 @@ class Simplifier:
         if isinstance(e, ast.Unary):
             if e.op in ("++", "--"):
                 e.operand = self.lvalue(e.operand, env)
-                self._kill(env, {base_name(e.operand)})
+                b = base_name(e.operand)
+                self._kill(env, {b} if b else set(env.keys()))
                 return e
             e.operand = self.expr(e.operand, env)
             return self._simplify_unary(e)
         if isinstance(e, ast.Postfix):
             e.operand = self.lvalue(e.operand, env)
-            self._kill(env, {base_name(e.operand)})
+            b = base_name(e.operand)
+            self._kill(env, {b} if b else set(env.keys()))
             return e
         if isinstance(e, ast.Binary):
             return self._binary(e, env)
         if isinstance(e, ast.Assign):
             return self._assign(e, env)
         if isinstance(e, ast.Call):
-            e.args = [self.expr(a, env) for a in e.args]
+            info = getattr(e, "_function", None)
+            new_args = []
+            for i, a in enumerate(e.args):
+                ref_arg = False
+                if info and i < len(info.params):
+                    ref_arg = bool(getattr(info.params[i], "is_reference", False))
+                if ref_arg and isinstance(a, ast.Identifier):
+                    # preserve lvalue identity for reference parameters
+                    b = base_name(a)
+                    if b:
+                        self.unsafe.add(b)
+                        self._kill(env, {b})
+                    new_args.append(a)
+                else:
+                    na = self.expr(a, env)
+                    if ref_arg:
+                        # if simplified to non-lvalue expr, keep original lvalue-ish node as fallback
+                        if not isinstance(na, (ast.Identifier, ast.Index, ast.Deref)):
+                            b = base_name(a)
+                            if b:
+                                self.unsafe.add(b)
+                                self._kill(env, {b})
+                            na = a
+                    new_args.append(na)
+                # reference args may alias/mutate the referent
+                if ref_arg:
+                    b = base_name(a)
+                    self._kill(env, {b} if b else set(env.keys()))
+            e.args = new_args
+            # calls may modify through refs/pointers/aliases; be conservative
+            self._kill(env, set(env.keys()))
             return e
         if isinstance(e, ast.Index):
             e.array = self.expr(e.array, env)
@@ -334,6 +381,10 @@ class Simplifier:
             return e
         if isinstance(e, ast.AddressOf):
             e.operand = self.lvalue(e.operand, env)
+            b = base_name(e.operand)
+            if b:
+                self.unsafe.add(b)
+                self._kill(env, {b})
             return e
         if isinstance(e, ast.Deref):
             e.operand = self.expr(e.operand, env)
@@ -368,6 +419,9 @@ class Simplifier:
         e.target = self.lvalue(e.target, env)
         e.value = self.expr(e.value, env)
         if isinstance(e.target, ast.Identifier):
+            if e.target.name in getattr(self, "unsafe", set()):
+                self._kill(env, {e.target.name})
+                return e
             entry = env.get(e.target.name)
             if entry is not None:
                 new = None
@@ -381,6 +435,9 @@ class Simplifier:
                             if r:
                                 new = convert(make_literal(r[0], r[1], e), entry.type)
                 env[e.target.name] = Entry(entry.type, new)
+        else:
+            # writes through deref/index may alias unknown locations; be conservative
+            self._kill(env, set(env.keys()))
         return e
 
     # ----- unary -----

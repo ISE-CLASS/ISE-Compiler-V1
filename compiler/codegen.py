@@ -114,10 +114,13 @@ class X86Codegen:
         self.current_function = None
         self.epilogue = ""
         self.pending_params = []
-        self.func_nodes = {
-            item.name: item for item in program.items
-            if isinstance(item, ast.FunctionDecl)
-        }
+        self.func_nodes = {}
+        for item in program.items:
+            if isinstance(item, ast.FunctionDecl):
+                mangled = getattr(item, "mangled_name", None) or item.name
+                self.func_nodes[mangled] = item
+                # keep last-seen name mapping as fallback for legacy/single defs
+                self.func_nodes[item.name] = item
         self._global_labels = {}
         for item in program.items:
             if isinstance(item, ast.VarDecl):
@@ -248,15 +251,16 @@ class X86Codegen:
     # Functions
     # ------------------------------------------------------------------
     def _function(self, fn):
-        node = self.func_nodes.get(fn.name)
+        mangled = fn.mangled_name or fn.name
+        node = self.func_nodes.get(mangled) or self.func_nodes.get(fn.name)
         self.current_function = fn
         self.slots = {}
         self.temp_slots = {}
         self.pending_params = []
         self._label_counter = 0
         self._collect_frame(fn, node)
-        self.epilogue = ".Lend_{}".format(fn.mangled_name or fn.name)
-        label = self.func_label(fn.mangled_name or fn.name)
+        self.epilogue = ".Lend_{}".format(mangled)
+        label = self.func_label(mangled)
         self.text.append(".globl {}".format(label))
         self.text.append("{}:".format(label))
         self.text.append("    push rbp")

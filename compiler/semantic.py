@@ -150,9 +150,13 @@ def compatible(dst, src):
         return True
     if not dst0 or not src0:
         return False
-    # pointer compatibility (simple subset): same pointer type, or null-like int 0 handled elsewhere not modeled as literal type
+    # pointer compatibility (simple subset): same pointer type, or array-to-pointer decay
     if is_pointer_type(dst0) or is_pointer_type(src0):
-        return dst0 == src0
+        if is_array_type(src0) and is_pointer_type(dst0):
+            return dst0 == decay_param_type(src0)
+        if dst0 == src0:
+            return True
+        return False
     if is_array_type(dst0) or is_array_type(src0):
         # allow array decay source to pointer destination
         if is_array_type(src0) and is_pointer_type(dst0):
@@ -1265,8 +1269,18 @@ class SemanticAnalyzer:
                 if is_array_type(strip_top_ref(expected)) and is_pointer_type(at) and decay_param_type(expected) == at:
                     return 3
                 if compatible(expected, atyp) or compatible(et, atyp):
-                    if base_type(strip_top_ref(expected)) == base_type(at) or et == at:
+                    eb = base_type(strip_top_ref(expected))
+                    ab = base_type(at)
+                    if et == at or eb == ab:
                         return 2
+                    if eb in NUMERIC and ab in NUMERIC:
+                        # prefer non-narrowing/wider conversions for floating args
+                        if ab in ("float", "double") and eb in ("double", "float"):
+                            return 2 if eb == "double" else 1
+                        if ab in ("float", "double") and eb in ("int", "char", "bool"):
+                            return 1
+                        if ab in ("int", "char", "bool") and eb in ("float", "double"):
+                            return 2
                     return 1
                 return None
 
