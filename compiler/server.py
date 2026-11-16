@@ -225,9 +225,12 @@ class CompilerHTTPRequestHandler(BaseHTTPRequestHandler):
 
 
 def main(argv=None):
+    default_host = os.environ.get("HOST") or ("0.0.0.0" if os.environ.get("PORT") else "127.0.0.1")
+    default_port = int(os.environ.get("PORT", "8000"))
+
     parser = argparse.ArgumentParser(description="COMPILED compiler HTTP service")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--host", default=default_host)
+    parser.add_argument("--port", type=int, default=default_port)
     parser.add_argument("--open", action="store_true", help="open the UI in a browser")
     parser.add_argument("--quiet", action="store_true", help="suppress request logging")
     args = parser.parse_args(argv)
@@ -247,7 +250,7 @@ def main(argv=None):
                                    else "(run 'cd ui; npm run build')"))
     print("  Toolchain: {}".format(toolchain.version if toolchain else "not found"))
     print("Press Ctrl+C to stop.")
-    if args.open:
+    if args.open and not os.environ.get("PORT"):
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     try:
         server.serve_forever()

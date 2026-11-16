@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: compiled-compiler
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: COMPILED_QUIET
+        value: "1"

@@ -213,9 +213,12 @@ function App() {
     const configured = import.meta.env.VITE_COMPILER_API_URL?.replace(/\/$/, "");
     if (configured) return configured;
     if (typeof window === "undefined") return "http://localhost:8000";
-    if (window.location.port === "8000") return window.location.origin;
-    const host = window.location.hostname || "localhost";
-    return `http://${host}:8000`;
+
+    const { origin, hostname, port } = window.location;
+    if (port === "8000") return origin;
+    if (port === "5173" || port === "4173") return `http://${hostname || "localhost"}:8000`;
+    if (import.meta.env.DEV) return `http://${hostname || "localhost"}:8000`;
+    return origin;
   }, []);
 
   useEffect(() => {
