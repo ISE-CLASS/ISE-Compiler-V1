@@ -119,4 +119,9 @@ class UnusedVariableRemover:
             if s.body is not None:
                 s.body = self.rewrite(s.body, dead) or ast.EmptyStmt(s.line, s.col)
             return s
+        if isinstance(s, ast.Switch):
+            for section in s.cases:
+                if isinstance(section, (ast.Case, ast.Default)):
+                    section.body = self.rewrite_list(section.body, dead)
+            return s
         return s

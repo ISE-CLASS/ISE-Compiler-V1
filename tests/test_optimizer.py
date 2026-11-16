@@ -249,7 +249,14 @@ class BehaviourPreserved(unittest.TestCase):
                 with open(cpp, "w") as f:
                     f.write(text)
                 subprocess.run(["g++", "-std=c++17", "-w", "-o", exe, cpp], check=True)
-                results.append(subprocess.run([exe], input=stdin, capture_output=True, text=True).stdout)
+                try:
+                    completed = subprocess.run([exe], input=stdin, capture_output=True, text=True)
+                except OSError as exc:
+                    blocked = getattr(exc, "winerror", None) == 4551 or "Application Control policy has blocked this file" in str(exc)
+                    if blocked:
+                        self.skipTest("execution blocked by host policy: {}".format(exc))
+                    raise
+                results.append(completed.stdout)
         self.assertEqual(results[0], results[1])
 
     def test_examples(self):

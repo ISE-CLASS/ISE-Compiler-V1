@@ -1,0 +1,10 @@
+# Python dependencies for ISE-Compiler-V1 (COMPILED)
+#
+# Core compiler/tokenizer/parser/optimizer/semantic/IR/codegen/server modules
+# use only the Python standard library.
+# Recommended: Python 3.10+ (tested with modern CPython 3.x; Docker image uses 3.12)
+
+# No required third-party pip packages.
+
+# Optional: automaton diagram export in cpp_tokenizer.export_automaton_graphviz
+# graphviz>=0.20

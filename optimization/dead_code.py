@@ -74,6 +74,8 @@ class DeadCodeEliminator:
             return self.do_while(s)
         if isinstance(s, ast.For):
             return self.for_stmt(s)
+        if isinstance(s, ast.Switch):
+            return self.switch_stmt(s)
         return [s]
 
     def expr_stmt(self, s):
@@ -148,4 +150,12 @@ class DeadCodeEliminator:
             return [] if is_pure(s.init) else [ast.ExprStmt(s.init, s.line, s.col)]
         if s.body is not None:
             s.body = self.as_single(self.stmt(s.body), s)
+        return [s]
+
+    def switch_stmt(self, s):
+        for section in s.cases:
+            if isinstance(section, ast.Case):
+                section.body = self.statements(section.body)
+            elif isinstance(section, ast.Default):
+                section.body = self.statements(section.body)
         return [s]

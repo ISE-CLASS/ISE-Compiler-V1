@@ -169,20 +169,26 @@ def is_pure(expr):
     if isinstance(expr, (ast.Literal, ast.Identifier)):
         return True
     if isinstance(expr, ast.Unary):
-        return expr.op in ("-", "+", "!") and is_pure(expr.operand)
+        return expr.op in ("-", "+", "!", "~") and is_pure(expr.operand)
+    if isinstance(expr, ast.AddressOf):
+        return is_pure(expr.operand)
+    if isinstance(expr, ast.Deref):
+        return is_pure(expr.operand)
     if isinstance(expr, ast.Binary):
         if expr.op in ("<<", ">>"):
             return False
         return is_pure(expr.left) and is_pure(expr.right)
     if isinstance(expr, ast.Index):
         return is_pure(expr.array) and is_pure(expr.index)
+    if isinstance(expr, ast.Ternary):
+        return is_pure(expr.condition) and is_pure(expr.when_true) and is_pure(expr.when_false)
     return False
 
 
 def base_name(target):
     """Name of the variable written through an assignment target."""
-    while isinstance(target, ast.Index):
-        target = target.array
+    while isinstance(target, (ast.Index, ast.Deref)):
+        target = target.array if isinstance(target, ast.Index) else target.operand
     return target.name if isinstance(target, ast.Identifier) else None
 
 

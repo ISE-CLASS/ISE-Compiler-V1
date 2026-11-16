@@ -15,7 +15,7 @@ from dataclasses import fields
 from .ast_nodes import Node
 
 POSITION_FIELDS = ("line", "col")
-FLAT_LISTS = ("items", "statements", "elements")
+FLAT_LISTS = ("items", "statements", "elements", "cases", "body")
 
 # Box-drawing characters and their plain-ASCII replacements, for consoles
 # that cannot print Unicode (e.g. the default Windows cp1252 console).
@@ -37,7 +37,9 @@ def _label(node, show_positions):
     parts = [type(node).__name__]
     for f in fields(node):
         value = getattr(node, f.name)
-        if f.name in POSITION_FIELDS or isinstance(value, (Node, list)) or value is None:
+        if f.name in POSITION_FIELDS or f.name in ("mangled_name",):
+            continue
+        if isinstance(value, (Node, list)) or value is None:
             continue
         if value is False:
             continue
@@ -61,9 +63,9 @@ def _format(node, name, prefix, child_prefix, lines, show_positions):
     head = name + ": " if name else ""
     lines.append(prefix + head + _label(node, show_positions))
     children = _children(node)
-    # Container lists (Program.items, Block.statements, InitList.elements)
-    # show their items directly, without an extra level.
-    if len(children) == 1 and children[0][0] in FLAT_LISTS:
+    # Container lists (Program.items, Block.statements, InitList.elements, Switch.cases,
+    # Case/Default.body lists) show their items directly, without an extra level.
+    if len(children) == 1 and children[0][0] in FLAT_LISTS and isinstance(children[0][1], list):
         entries = [("", item) for item in children[0][1]]
     else:
         entries = children

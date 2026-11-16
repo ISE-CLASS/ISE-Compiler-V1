@@ -58,6 +58,9 @@ class Param(Node):
     type_name: str
     name: Optional[str]           # None when unnamed, e.g. "int f(int);"
     is_array: bool = False        # int arr[] or int arr[10]
+    is_const: bool = False
+    pointer_depth: int = 0
+    is_reference: bool = False
     line: int = 0
     col: int = 0
 
@@ -68,6 +71,7 @@ class FunctionDecl(Node):
     name: str
     params: List[Param] = field(default_factory=list)
     body: Optional["Block"] = None   # None for a declaration (prototype) like "int f(int);"
+    mangled_name: Optional[str] = None
     line: int = 0
     col: int = 0
 
@@ -81,6 +85,8 @@ class Declarator(Node):
     is_array: bool = False
     array_size: Optional[Expr] = None   # None for "int a[] = {...}" or non-arrays
     init: Optional[Node] = None         # Expr or InitList
+    is_const: bool = False
+    pointer_depth: int = 0
     line: int = 0
     col: int = 0
 
@@ -89,6 +95,7 @@ class Declarator(Node):
 class VarDecl(Stmt):
     type_name: str
     declarators: List[Declarator] = field(default_factory=list)   # int a = 1, b;  -> 2 declarators
+    is_const: bool = False
     line: int = 0
     col: int = 0
 
@@ -177,6 +184,29 @@ class Continue(Stmt):
     col: int = 0
 
 
+@dataclass
+class Case(Stmt):
+    value: Expr
+    body: List[Stmt] = field(default_factory=list)
+    line: int = 0
+    col: int = 0
+
+
+@dataclass
+class Default(Stmt):
+    body: List[Stmt] = field(default_factory=list)
+    line: int = 0
+    col: int = 0
+
+
+@dataclass
+class Switch(Stmt):
+    expr: Expr
+    cases: List[Node] = field(default_factory=list)   # Case / Default in source order
+    line: int = 0
+    col: int = 0
+
+
 # ---------------------------------------------------------------
 # Expressions
 # ---------------------------------------------------------------
@@ -199,8 +229,31 @@ class Binary(Expr):
 
 
 @dataclass
+class Ternary(Expr):
+    condition: Expr
+    when_true: Expr
+    when_false: Expr
+    line: int = 0
+    col: int = 0
+
+
+@dataclass
 class Unary(Expr):
-    op: str                       # prefix: "-", "+", "!", "++", "--"
+    op: str                       # prefix: "-", "+", "!", "~", "++", "--"
+    operand: Expr
+    line: int = 0
+    col: int = 0
+
+
+@dataclass
+class AddressOf(Expr):
+    operand: Expr
+    line: int = 0
+    col: int = 0
+
+
+@dataclass
+class Deref(Expr):
     operand: Expr
     line: int = 0
     col: int = 0
@@ -218,6 +271,7 @@ class Postfix(Expr):
 class Call(Expr):
     callee: Expr                  # usually an Identifier
     args: List[Expr] = field(default_factory=list)
+    mangled_name: Optional[str] = None
     line: int = 0
     col: int = 0
 

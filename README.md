@@ -1,4 +1,11 @@
-# C++ Tokenizer (`cpp_tokenizer.py`)
+# ISE-Compiler-V1 (COMPILED)
+
+A C++-subset compiler project with a Python implementation (tokenization, parsing, semantic analysis, optimization, IR generation, x86-64 assembly/code generation, build/run integration) and a React/TypeScript web UI.
+
+- **Install & run instructions:** see [`INSTALL.md`](./INSTALL.md)
+- **Python dependencies:** [`requirements.txt`](./requirements.txt) (core uses Python standard library)
+
+## C++ Tokenizer (`cpp_tokenizer.py`)
 
 The lexical analyzer (scanner) for our C++ compiler project. It reads C++ source text and turns it into a list of **tokens**, each with its type, text, and position. It also reports lexical errors without stopping, so one run finds every problem.
 
@@ -196,3 +203,14 @@ See [ui/README.md](./ui/README.md) for local setup, project persistence,
 GitHub workflow guidance and the HTTP integration contract for connecting
 the Python compiler phases. Workspace shortcuts are listed in
 [ui/SHORTCUTS.md](./ui/SHORTCUTS.md).
+
+## 11. Deploy on Render
+
+This repo includes a root [`Dockerfile`](./Dockerfile) and [`render.yaml`](./render.yaml) for deploying the UI and compiler service together as a single Render Web Service.
+
+- **Blueprint:** create a new Render Blueprint from the repo (Render will use `render.yaml`).
+- **Manual Docker deploy:** create a Web Service with runtime **Docker**, root/context set to this directory (`ISE-Compiler-V1`), and Dockerfile path `./Dockerfile`.
+- The container builds `ui/dist`, installs a C++ toolchain (`g++`), and starts `python -m compiler.server` on Render's `$PORT`.
+- The server serves the built UI and `/api/*` from the same origin; no separate frontend host or `VITE_COMPILER_API_URL` is required in this setup.
+
+> Note: the service compiles and runs submitted C++ with the host toolchain. If exposed publicly, add authentication/rate limiting and run with appropriate isolation and resource controls.
