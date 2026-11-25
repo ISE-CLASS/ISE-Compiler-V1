@@ -187,6 +187,7 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<CompilerResult | null>(null);
   const [runError, setRunError] = useState("");
+  const [stdinText, setStdinText] = useState("");
   const [connection, setConnection] = useState<Connection>("checking");
   const [toast, setToast] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
@@ -367,7 +368,7 @@ function App() {
         body: JSON.stringify({
           filename: currentFile.name.split("/").pop(),
           source: currentFile.value,
-          stdin: "",
+          stdin: stdinText,
           optimize: true,
         }),
       });
@@ -743,6 +744,21 @@ function App() {
                 {busy ? "Running" : "Run"}
               </button>
             </div>
+          </div>
+
+          <div className="stdin-panel">
+            <label className="stdin-label" htmlFor="stdin-input">
+              <Terminal size={13} /><span>Program input</span><small>stdin for cin</small>
+            </label>
+            <textarea
+              id="stdin-input"
+              className="stdin-input"
+              value={stdinText}
+              onChange={(event) => setStdinText(event.target.value)}
+              placeholder="Type input for cin, one value per line…"
+              spellCheck={false}
+              rows={2}
+            />
           </div>
 
           <div className="results-panel">

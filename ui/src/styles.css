@@ -154,6 +154,13 @@ kbd { display: inline-flex; align-items: center; gap: 3px; border: 1px solid var
 .run-button { display: flex; height: 31px; align-items: center; gap: 7px; padding: 0 12px; border: 0; border-radius: 6px; background: var(--green); color: #17200f; font-size: 10px; font-weight: 700; cursor: pointer; transition: transform .12s, background .15s; }
 .run-button:hover:not(:disabled), .empty-run:hover { transform: translateY(-1px); background: var(--green-strong); }
 .run-button:disabled { opacity: .6; cursor: not-allowed; }
+.stdin-panel { display: flex; flex: 0 0 auto; flex-direction: column; gap: 6px; padding: 9px 12px; border-bottom: 1px solid var(--line); background: var(--surface); }
+.stdin-label { display: flex; align-items: center; gap: 6px; color: var(--text-soft); font-size: 10px; font-weight: 600; }
+.stdin-label svg { color: var(--green); }
+.stdin-label small { color: var(--muted); font-size: 9px; font-weight: 400; }
+.stdin-input { width: 100%; min-height: 44px; max-height: 96px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; outline: 0; background: var(--editor); color: var(--text); font-family: var(--mono); font-size: 10px; line-height: 1.55; resize: vertical; }
+.stdin-input:focus { border-color: #9fcc6466; }
+.stdin-input::placeholder { color: var(--muted); }
 .results-panel { display: flex; min-height: 220px; flex: 1; flex-direction: column; overflow: hidden; }
 .panel-tabs { display: flex; min-height: 42px; flex: 0 0 42px; align-items: stretch; gap: 13px; overflow-x: auto; overflow-y: hidden; padding: 0 12px; border-bottom: 1px solid var(--line); scrollbar-width: none; }
 .panel-tabs::-webkit-scrollbar { display: none; }
