@@ -19,19 +19,25 @@ import argparse
 import json
 import mimetypes
 import os
+import re
 import sys
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from . import compile_source
+from .run_session import RunSessionManager, interactive_command
 from .toolchain import detect_toolchain
 
 ROOT = Path(__file__).resolve().parent.parent
 UI_DIST = ROOT / "ui" / "dist"
 MAX_BODY = 2 * 1024 * 1024
+SESSIONS = RunSessionManager()
+RUN_POLL_PATH = re.compile(r"^/api/run/([^/]+)/poll$")
+RUN_INPUT_PATH = re.compile(r"^/api/run/([^/]+)/input$")
+RUN_STOP_PATH = re.compile(r"^/api/run/([^/]+)/stop$")
 
 POST_STAGES = {
     "/api/compile": "compile",
@@ -103,6 +109,109 @@ class CompilerHTTPRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("request body must be a JSON object")
         return payload
 
+    @staticmethod
+    def _timeout(payload):
+        try:
+            return max(1, min(60, int(payload.get("timeout", 10))))
+        except (TypeError, ValueError):
+            return 10
+
+    def _after(self, source):
+        try:
+            if isinstance(source, dict):
+                value = source.get("after", 0)
+            else:
+                query = parse_qs(urlparse(self.path).query)
+                value = query.get("after", ["0"])[0]
+            return max(0, int(value))
+        except (TypeError, ValueError, IndexError):
+            return 0
+
+    def _missing_session(self):
+        self._send_json(404, {"ok": False, "diagnostics": ["run session not found"]})
+
+    # ------------------------------------------------------------------
+    # Interactive run sessions
+    # ------------------------------------------------------------------
+    def _start_run_session(self):
+        try:
+            payload = self._read_json()
+        except ValueError as exc:
+            self._send_json(400, {"ok": False, "diagnostics": [str(exc)]})
+            return
+
+        source = str(payload.get("source", "") or "")
+        filename = str(payload.get("filename") or "main.cpp")
+        optimize = bool(payload.get("optimize", True))
+        timeout = self._timeout(payload)
+
+        try:
+            result = compile_source(
+                source,
+                filename=filename,
+                stage="compile",
+                optimize=optimize,
+                stdin="",
+                run=False,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            self._send_json(500, {
+                "ok": False,
+                "stage": "run",
+                "diagnostics": ["Internal compiler error: {}".format(exc)],
+                "output": "Internal compiler error: {}".format(exc),
+            })
+            return
+
+        build = result.get("build") or {}
+        executable = build.get("executable")
+        if not result.get("ok") or not build.get("ok") or not executable:
+            result["session"] = None
+            self._send_json(200, result)
+            return
+
+        session = SESSIONS.create(
+            interactive_command(executable),
+            timeout=timeout,
+            cwd=str(Path(executable).parent),
+            executable=str(executable),
+        )
+        result["session"] = {"id": session.id, "status": "running"}
+        result["output"] = "Program started. Type input below when it waits for cin."
+        self._send_json(200, result)
+
+    def _run_session_input(self, session_id):
+        session = SESSIONS.get(session_id)
+        if session is None:
+            self._missing_session()
+            return
+        try:
+            payload = self._read_json()
+        except ValueError as exc:
+            self._send_json(400, {"ok": False, "diagnostics": [str(exc)]})
+            return
+        text = payload.get("input", "")
+        session.send("" if text is None else str(text))
+        if bool(payload.get("close", False)):
+            session.close_stdin()
+        self._send_json(200, session.snapshot(after=self._after(payload)))
+
+    def _run_session_poll(self, session_id):
+        session = SESSIONS.get(session_id)
+        if session is None:
+            self._missing_session()
+            return
+        self._send_json(200, session.snapshot(after=self._after(None)))
+
+    def _run_session_stop(self, session_id):
+        session = SESSIONS.get(session_id)
+        if session is None:
+            self._missing_session()
+            return
+        session.stop()
+        self._send_json(200, session.snapshot())
+
     # ------------------------------------------------------------------
     # HTTP verbs
     # ------------------------------------------------------------------
@@ -135,10 +244,25 @@ class CompilerHTTPRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/stages":
             self._send_json(200, {"ok": True, "stages": list(POST_STAGES.values())})
             return
+        match = RUN_POLL_PATH.match(path)
+        if match:
+            self._run_session_poll(match.group(1))
+            return
         self._serve_static(path)
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
+        if path == "/api/run/start":
+            self._start_run_session()
+            return
+        match = RUN_INPUT_PATH.match(path)
+        if match:
+            self._run_session_input(match.group(1))
+            return
+        match = RUN_STOP_PATH.match(path)
+        if match:
+            self._run_session_stop(match.group(1))
+            return
         stage = POST_STAGES.get(path)
         if stage is None:
             self._send_json(404, {"ok": False, "diagnostics": ["unknown endpoint"]})

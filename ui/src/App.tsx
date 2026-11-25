@@ -34,7 +34,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { type FormEvent, type MouseEvent as ReactMouseEvent, useEffect, useMemo, useRef, useState } from "react";
+import { type FormEvent, type MouseEvent as ReactMouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type SourceFile = { name: string; value: string };
 type Project = { id: string; name: string; files: SourceFile[]; folders: string[] };
@@ -79,9 +79,21 @@ type CompilerResult = {
   optimized_source?: string;
   ir?: string;
   assembly?: string;
-  execution?: { ok?: boolean; stdout?: string; stderr?: string; returncode?: number | null; log?: string };
+  execution?: { ok?: boolean; stdout?: string; stderr?: string; returncode?: number | null; log?: string } | null;
   toolchain?: { name?: string | null; version?: string; target?: string; supports_assembly?: boolean };
   stages?: { name: string; ok: boolean; detail?: string; duration_ms?: number }[];
+};
+type RunEventStream = "stdout" | "stderr" | "stdin" | "system";
+type RunEvent = { id: number; stream: RunEventStream; text: string };
+type SessionSnapshot = {
+  id: string;
+  next: number;
+  status: "running" | "exited";
+  events: RunEvent[];
+  returncode?: number | null;
+  timed_out?: boolean;
+  log?: string;
+  execution?: { ok?: boolean; stdout?: string; stderr?: string; returncode?: number | null; log?: string } | null;
 };
 type SymbolTable = {
   functions?: SymbolInfo[];
@@ -188,6 +200,14 @@ function App() {
   const [result, setResult] = useState<CompilerResult | null>(null);
   const [runError, setRunError] = useState("");
   const [stdinText, setStdinText] = useState("");
+  const [session, setSession] = useState<{ id: string; status: "running" | "exited" } | null>(null);
+  const [sessionEvents, setSessionEvents] = useState<RunEvent[]>([]);
+  const [sessionReturncode, setSessionReturncode] = useState<number | null | undefined>(undefined);
+  const [inputBusy, setInputBusy] = useState(false);
+  const activeSessionIdRef = useRef<string | null>(null);
+  const sessionCursorRef = useRef(0);
+  const sessionPollBusyRef = useRef(false);
+  const sessionOutputRef = useRef<HTMLPreElement>(null);
   const [connection, setConnection] = useState<Connection>("checking");
   const [toast, setToast] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
@@ -306,6 +326,114 @@ function App() {
     document.body.style.userSelect = "none";
   };
 
+  const applySessionSnapshot = useCallback((snapshot: SessionSnapshot) => {
+    if (activeSessionIdRef.current !== snapshot.id) return;
+    setSession({ id: snapshot.id, status: snapshot.status });
+    if (snapshot.events.length) {
+      setSessionEvents((current) => {
+        const seen = new Set(current.map((event) => event.id));
+        const fresh = snapshot.events.filter((event) => !seen.has(event.id));
+        return fresh.length ? [...current, ...fresh] : current;
+      });
+    }
+    sessionCursorRef.current = Math.max(sessionCursorRef.current, snapshot.next);
+    setSessionReturncode(snapshot.returncode);
+    if (snapshot.status === "exited" && snapshot.execution) {
+      setResult((current) => ({
+        ...(current ?? {}),
+        ok: snapshot.execution?.ok,
+        execution: snapshot.execution,
+      }));
+    }
+  }, []);
+
+  const stopCurrentSession = async () => {
+    const id = activeSessionIdRef.current;
+    activeSessionIdRef.current = null;
+    setSession(null);
+    setSessionEvents([]);
+    setSessionReturncode(undefined);
+    sessionCursorRef.current = 0;
+    if (!id) return;
+    try {
+      await fetch(`${apiUrl}/api/run/${id}/stop`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+    } catch {
+      // The server expires abandoned sessions; stopping is best-effort.
+    }
+  };
+
+  const sendSessionInput = async (addNewline: boolean, closeInput = false) => {
+    const id = activeSessionIdRef.current;
+    if (!id || session?.status !== "running" || inputBusy) return;
+    let text = closeInput ? "" : stdinText;
+    if (!closeInput && addNewline && text && !text.endsWith("\n")) text = `${text}\n`;
+    if (!text && !closeInput) return;
+
+    setInputBusy(true);
+    try {
+      const response = await fetch(`${apiUrl}/api/run/${id}/input`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          input: text,
+          close: closeInput,
+          after: sessionCursorRef.current,
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(`Input service returned ${response.status} ${response.statusText}`.trim());
+      }
+      const snapshot: unknown = await response.json();
+      if (snapshot && typeof snapshot === "object") {
+        applySessionSnapshot(snapshot as SessionSnapshot);
+      }
+      if (!closeInput) setStdinText("");
+      setConnection("connected");
+    } catch (error) {
+      setRunError(error instanceof Error ? error.message : "Could not send program input.");
+      setPanel("problems");
+    } finally {
+      setInputBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    const id = session?.id;
+    if (!id || session?.status !== "running") return;
+    let cancelled = false;
+    const poll = async () => {
+      if (sessionPollBusyRef.current || cancelled) return;
+      sessionPollBusyRef.current = true;
+      try {
+        const response = await fetch(`${apiUrl}/api/run/${id}/poll?after=${sessionCursorRef.current}`);
+        if (!response.ok) throw new Error(`Poll returned ${response.status}`);
+        const snapshot = await response.json() as SessionSnapshot;
+        if (!cancelled) applySessionSnapshot(snapshot);
+      } catch {
+        // A missed poll is transient; keep streaming on the next tick.
+      } finally {
+        sessionPollBusyRef.current = false;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 150);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [apiUrl, session?.id, session?.status, applySessionSnapshot]);
+
+  useEffect(() => {
+    if (panel !== "output") return;
+    const output = sessionOutputRef.current;
+    const container = output?.closest(".panel-content") as HTMLElement | null;
+    if (container) container.scrollTop = container.scrollHeight;
+  }, [sessionEvents, panel]);
+
   useEffect(() => {
     const handleShortcuts = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -340,6 +468,7 @@ function App() {
 
   const runCompiler = async (selectedStage: CompilerStage = stage) => {
     if (!currentFile) return;
+    await stopCurrentSession();
     setBusy(true);
     setRunError("");
     setResult(null);
@@ -361,16 +490,50 @@ function App() {
       }
     }
 
+    const body = JSON.stringify({
+      filename: currentFile.name.split("/").pop(),
+      source: currentFile.value,
+      stdin: stdinText,
+      optimize: true,
+    });
+
     try {
+      if (selectedStage === "run") {
+        const response = await fetch(`${apiUrl}/api/run/start`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+        });
+        if (!response.ok) {
+          throw new Error(`Compiler service returned ${response.status} ${response.statusText}`.trim());
+        }
+        const payload: unknown = await response.json();
+        if (!payload || typeof payload !== "object") {
+          throw new Error("Compiler service returned an invalid response.");
+        }
+        const compilerResult = payload as CompilerResult & {
+          session?: { id: string; status: string } | null;
+        };
+        setResult(compilerResult);
+        setConnection("connected");
+        const sessionId = compilerResult.session?.id;
+        if (sessionId) {
+          activeSessionIdRef.current = sessionId;
+          sessionCursorRef.current = 0;
+          setSession({ id: sessionId, status: "running" });
+          setSessionEvents([]);
+          setSessionReturncode(undefined);
+          setToast("Program running — send input below when prompted");
+          return;
+        }
+        setPanel(compilerResult.ok === false ? "problems" : "output");
+        return;
+      }
+
       const response = await fetch(`${apiUrl}/api/${selectedStage}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          filename: currentFile.name.split("/").pop(),
-          source: currentFile.value,
-          stdin: stdinText,
-          optimize: true,
-        }),
+        body,
       });
       if (!response.ok) {
         throw new Error(`Compiler service returned ${response.status} ${response.statusText}`.trim());
@@ -739,26 +902,49 @@ function App() {
                 </select>
                 <ChevronDown size={13} />
               </label>
-              <button className="run-button" onClick={() => void runCompiler()} disabled={busy || !isCpp}>
-                {busy ? <RotateCcw className="spin" size={15} /> : <Play size={14} fill="currentColor" />}
-                {busy ? "Running" : "Run"}
+              <button className="run-button" onClick={() => void runCompiler()} disabled={busy || session?.status === "running" || !isCpp}>
+                {busy || session?.status === "running" ? <RotateCcw className="spin" size={15} /> : <Play size={14} fill="currentColor" />}
+                {busy || session?.status === "running" ? "Running" : "Run"}
               </button>
             </div>
           </div>
 
           <div className="stdin-panel">
             <label className="stdin-label" htmlFor="stdin-input">
-              <Terminal size={13} /><span>Program input</span><small>stdin for cin</small>
+              <Terminal size={13} /><span>Program input</span>
+              <small>{session?.status === "running" ? "press Enter to send to cin" : "stdin for cin"}</small>
             </label>
             <textarea
               id="stdin-input"
               className="stdin-input"
               value={stdinText}
               onChange={(event) => setStdinText(event.target.value)}
-              placeholder="Type input for cin, one value per line…"
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey && session?.status === "running") {
+                  event.preventDefault();
+                  void sendSessionInput(true);
+                }
+              }}
+              placeholder={session?.status === "running" ? "Type input and press Enter…" : "Run a program, then type when it prompts…"}
               spellCheck={false}
               rows={2}
             />
+            <div className="stdin-actions">
+              <button
+                className="stdin-send"
+                onClick={() => void sendSessionInput(true)}
+                disabled={session?.status !== "running" || inputBusy}
+              >
+                <Play size={11} fill="currentColor" />Send input<kbd>↵</kbd>
+              </button>
+              <button
+                className="stdin-eof"
+                onClick={() => void sendSessionInput(false, true)}
+                disabled={session?.status !== "running" || inputBusy}
+              >
+                Send EOF
+              </button>
+            </div>
           </div>
 
           <div className="results-panel">
@@ -774,13 +960,43 @@ function App() {
             <div className="panel-content">
               {panel === "output" && (
                 <div className="output-view">
+                  {!busy && !runError && result?.diagnostics?.map((diagnostic, index) => (
+                    <div className="diagnostic" key={index}><Activity size={14} /><span>{diagnostic}</span></div>
+                  ))}
                   {busy ? (
                     <div className="empty-state"><div className="loader-ring" /><strong>Running {stage === "run" ? "your program" : `the ${stage} stage`}</strong><span>Waiting for compiler results…</span></div>
                   ) : runError ? (
                     <div className="error-card"><div className="error-title"><X size={15} />Could not reach the compiler service</div><p>{runError}</p><span>Start it with <code>python -m compiler.server --open</code>, then run again.</span></div>
+                  ) : session ? (
+                    <>
+                      <pre ref={sessionOutputRef} className="console-output live-output">
+                        {sessionEvents.length ? sessionEvents.map((event) => (
+                          <span key={event.id} className={`console-${event.stream}`}>
+                            {event.stream === "stdin" ? `> ${event.text}` : event.stream === "system" ? `[${event.text}]` : event.text}
+                          </span>
+                        )) : "Program started. Waiting for output…"}
+                      </pre>
+                      {result?.stages?.length ? (
+                        <div className="pipeline-stages">
+                          {result.stages.map((item) => (
+                            <span key={item.name} className={`pipeline-stage ${item.ok ? "pipeline-stage-ok" : "pipeline-stage-failed"}`} title={item.detail || ""}>
+                              {item.ok ? <Check size={11} /> : <X size={11} />}{item.name}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
+                      {session.status === "running" ? (
+                        <div className="run-status"><span className="live-dot" />Program running · send input below when prompted</div>
+                      ) : (
+                        <>
+                          <div className="run-complete"><Check size={13} />Run complete <span>·</span>exit {sessionReturncode ?? "unknown"}</div>
+                          {sessionReturncode !== 0 && sessionReturncode !== undefined && <div className="run-notice">Program exited with a non-zero status.</div>}
+                        </>
+                      )}
+                      {connection === "offline" && <div className="run-notice">Compiler not connected. Source was not compiled.</div>}
+                    </>
                   ) : result ? (
                     <>
-                      {result.diagnostics?.map((diagnostic, index) => <div className="diagnostic" key={index}><Activity size={14} /><span>{diagnostic}</span></div>)}
                       <pre className="console-output">{result.output || "No output."}</pre>
                       {result.stages?.length ? (
                         <div className="pipeline-stages">
